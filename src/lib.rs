@@ -2,7 +2,7 @@
 // This project is dual-licensed under Apache 2.0 and MIT terms.
 // See LICENSE-APACHE and LICENSE-MIT for details.
 
-//! Interface to MCP2221 and MCP2221A. Uses libusb, so no MCP2221 kernel module
+//! Interface to MCP2221 and MCP2221A. Uses hidapi, so no MCP2221 kernel module
 //! is required. Supports I2C and GPIO.
 
 use embedded_hal::blocking::i2c;
@@ -12,6 +12,7 @@ use std::time::Instant;
 
 const MCP2221A_VENDOR_ID: u16 = 0x04d8;
 const MCP2221A_DEVICE_ID: u16 = 0x00dd;
+#[allow(unused)]
 const MCP2221A_INTERFACE: u8 = 2;
 
 const COMMAND_RESET: u8 = 0x70;
@@ -30,7 +31,9 @@ const MCP_HEADER_SIZE: usize = 4;
 const MCP_MAX_DATA_SIZE: usize = MCP_TRANSFER_SIZE - MCP_HEADER_SIZE;
 const MCP_MAX_I2C_PACKET: usize = 65535;
 
+#[allow(unused)]
 const MCP_WRITE_ENDPOINT: u8 = 0x03; // host to device
+#[allow(unused)]
 const MCP_READ_ENDPOINT: u8 = 0x83; // device to host
 
 const RESET_SEQUENCE: [u8; 4] = [COMMAND_RESET, 0xAB, 0xCD, 0xEF];
@@ -50,7 +53,7 @@ pub type Result<T, E = Error> = core::result::Result<T, E>;
 pub enum Error {
     DeviceNotFound,
     WriteTooLarge,
-    UsbError(rusb::Error),
+    UsbError(hidapi::HidError),
     ReadTimeout,
     WriteTimeout,
     SetBusSpeedFailed,
@@ -68,14 +71,14 @@ pub enum Error {
 
 /// An MCP device that has been opened. Supports I2C and GPIO operations.
 pub struct Handle {
-    handle: rusb::DeviceHandle<rusb::GlobalContext>,
+    handle: hidapi::HidDevice,
     recv: [u8; MCP_TRANSFER_SIZE],
     config: Config,
 }
 
 /// A supported device that hasn't yet been opened.
 pub struct AvailableDevice {
-    device: rusb::Device<rusb::GlobalContext>,
+    device: hidapi::DeviceInfo,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -87,7 +90,7 @@ pub struct Config {
 }
 
 pub struct GpioConfig {
-    command_buffer: [u8; MCP_TRANSFER_SIZE],
+    command_buffer: [u8; MCP_TRANSFER_SIZE + 1],
 }
 
 pub enum Direction {
@@ -125,13 +128,13 @@ impl AvailableDevice {
     /// Returns all supported devices.
     pub fn list() -> Result<Vec<AvailableDevice>> {
         let mut devices = Vec::new();
-        for device in rusb::devices()?.iter() {
-            if let Ok(device_desc) = device.device_descriptor() {
-                if device_desc.vendor_id() == MCP2221A_VENDOR_ID
-                    && device_desc.product_id() == MCP2221A_DEVICE_ID
-                {
-                    devices.push(AvailableDevice { device });
-                }
+        let hidapi = hidapi::HidApi::new()?;
+        for device in hidapi.device_list() {
+            if device.vendor_id() == MCP2221A_VENDOR_ID
+                    && device.product_id() == MCP2221A_DEVICE_ID
+            {
+                let device = device.clone();
+                devices.push(AvailableDevice { device });
             }
         }
         Ok(devices)
@@ -139,14 +142,7 @@ impl AvailableDevice {
 
     /// Attempts to open the I2C device.
     pub fn open(&self, config: &Config) -> Result<Handle> {
-        let mut handle = self.open_device(config)?;
-        // Setting auto-detach will fail on platforms where it isn't supported
-        // (Windows). So we ignore the returned error in this case. Provided no
-        // driver has already claimed the device, it should be fine to continue.
-        // If some driver has claimed the device, then we'll fail on the next
-        // line when we try to claim it.
-        let _ = handle.set_auto_detach_kernel_driver(true);
-        handle.claim_interface(MCP2221A_INTERFACE)?;
+        let handle = self.open_device(&config)?;
         let mut i2c = Handle {
             handle,
             recv: [0u8; MCP_TRANSFER_SIZE],
@@ -156,29 +152,36 @@ impl AvailableDevice {
         Ok(i2c)
     }
 
-    fn open_device(&self, config: &Config) -> Result<rusb::DeviceHandle<rusb::GlobalContext>> {
+    fn open_device(&self, config: &Config) -> Result<hidapi::HidDevice> {
+        let hidapi = hidapi::HidApi::new()?;
         if config.reset_on_open {
             // Record which device we're opening so that we can reobtain it
             // after we reset the device.
-            let bus_number = self.device.bus_number();
+            // FIXME: Does hidapi provide a means to re-find a specific HID
+            // device after reset?
+            // let bus_number = self.device.bus_number();
 
-            let mut handle = self.device.open()?;
-            let _ = handle.set_auto_detach_kernel_driver(true);
-            handle.claim_interface(MCP2221A_INTERFACE)?;
-            let mut buffer = [0u8; MCP_TRANSFER_SIZE];
-            buffer[..RESET_SEQUENCE.len()].copy_from_slice(&RESET_SEQUENCE);
-            handle.write_interrupt(MCP_WRITE_ENDPOINT, &buffer, config.timeout)?;
+            let handle = self.device.open_device(&hidapi)?;
+            let mut buffer = [0u8; MCP_TRANSFER_SIZE + 1];
+            buffer[1..RESET_SEQUENCE.len()+1].copy_from_slice(&RESET_SEQUENCE);
+            handle.write(&buffer)?;
             std::thread::sleep(Duration::from_millis(1000));
             let start = Instant::now();
+
             while start.elapsed() < RESET_TIMEOUT {
-                if let Some(device) = first_device_on_bus(bus_number)? {
-                    return Ok(device.open()?);
+                let dev_list = AvailableDevice::list()?;
+
+                if dev_list.len() > 1 {
+                    return Err(Error::DeviceLostOnReset)
+                } else if dev_list.len() == 1 {
+                    return Ok(self.device.open_device(&hidapi)?)
                 }
+
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(Error::DeviceLostOnReset)
         } else {
-            Ok(self.device.open()?)
+            Ok(self.device.open_device(&hidapi)?)
         }
     }
 }
@@ -187,13 +190,9 @@ impl AvailableDevice {
 /// return the same device as we had before, but the devices address changes
 /// when it gets reset. Ideally, we would see what devices were on the bus
 /// before we reset, then see which "new" MCP device shows up after we reset.
-fn first_device_on_bus(bus_number: u8) -> Result<Option<rusb::Device<rusb::GlobalContext>>> {
-    for device in AvailableDevice::list()? {
-        if device.device.bus_number() == bus_number {
-            return Ok(Some(device.device));
-        }
-    }
-    Ok(None)
+#[allow(unused)]
+fn first_device_on_bus(bus_number: u8) -> Result<Option<hidapi::HidDevice>> {
+    unimplemented!();
 }
 
 impl Handle {
@@ -306,14 +305,15 @@ impl Handle {
     }
 
     pub fn get_gpio_config(&mut self) -> Result<GpioConfig> {
-        let mut buffer = [0u8; MCP_TRANSFER_SIZE];
-        buffer[0] = COMMAND_GET_SRAM_SETTINGS;
+        let mut buffer = [0u8; MCP_TRANSFER_SIZE + 1];
+        buffer[1] = COMMAND_GET_SRAM_SETTINGS;
         self.transfer(&buffer)?;
+        println!("{:X?}", self.recv);
         if self.recv[0] != COMMAND_GET_SRAM_SETTINGS || self.recv[1] != 0 {
             return Err(Error::GpioError);
         }
         let mut config = GpioConfig::default();
-        config.command_buffer[8..8 + NUM_GPIO_PINS]
+        config.command_buffer[8 + 1..8 + NUM_GPIO_PINS+1]
             .copy_from_slice(&self.recv[22..22 + NUM_GPIO_PINS]);
         Ok(config)
     }
@@ -361,22 +361,19 @@ impl Handle {
 
     fn cmd(&mut self, command: u8, arg1: u8, arg2: u8, arg3: u8, data: &[u8]) -> Result<()> {
         assert!(data.len() <= MCP_MAX_DATA_SIZE);
-        let mut buffer = [0u8; MCP_TRANSFER_SIZE];
-        buffer[0] = command;
-        buffer[1] = arg1;
-        buffer[2] = arg2;
-        buffer[3] = arg3;
-        buffer[MCP_HEADER_SIZE..MCP_HEADER_SIZE + data.len()].copy_from_slice(data);
+        let mut buffer = [0u8; MCP_TRANSFER_SIZE + 1];
+        buffer[1] = command;
+        buffer[2] = arg1;
+        buffer[3] = arg2;
+        buffer[4] = arg3;
+        buffer[MCP_HEADER_SIZE + 1..MCP_HEADER_SIZE + data.len() + 1].copy_from_slice(data);
         self.transfer(&buffer)
     }
 
     fn transfer(&mut self, buffer: &[u8]) -> Result<()> {
-        self.handle
-            .write_interrupt(MCP_WRITE_ENDPOINT, buffer, self.config.timeout)?;
+        self.handle.write(&buffer)?;
 
-        let size =
-            self.handle
-                .read_interrupt(MCP_READ_ENDPOINT, &mut self.recv, self.config.timeout)?;
+        let size = self.handle.read(&mut self.recv)?;
         if size != MCP_TRANSFER_SIZE {
             return Err(Error::ShortRead);
         }
@@ -462,10 +459,10 @@ pub struct DeviceInfo {
 
 impl Default for GpioConfig {
     fn default() -> Self {
-        let mut command_buffer = [0u8; MCP_TRANSFER_SIZE];
-        command_buffer[0] = COMMAND_SET_SRAM_SETTINGS;
+        let mut command_buffer = [0u8; MCP_TRANSFER_SIZE + 1];
+        command_buffer[1] = COMMAND_SET_SRAM_SETTINGS;
         // Tell MCP that we're changing GPIO settings.
-        command_buffer[7] = 1 << 7;
+        command_buffer[8] = 1 << 7;
         Self { command_buffer }
     }
 }
@@ -474,7 +471,7 @@ impl GpioConfig {
     /// Sets a GPIO pin to input or output.
     pub fn set_direction(&mut self, pin: usize, direction: Direction) {
         assert!(pin < NUM_GPIO_PINS);
-        let config = &mut self.command_buffer[8 + pin];
+        let config = &mut self.command_buffer[8 + pin + 1];
         const DIRECTION_BIT: u8 = 1 << 3;
         match direction {
             Direction::Input => *config |= DIRECTION_BIT,
@@ -485,7 +482,7 @@ impl GpioConfig {
     /// Sets the value of an output pin.
     pub fn set_value(&mut self, pin: usize, value: bool) {
         assert!(pin < NUM_GPIO_PINS);
-        let config = &mut self.command_buffer[8 + pin];
+        let config = &mut self.command_buffer[8 + pin + 1];
         const VALUE_BIT: u8 = 1 << 4;
         match value {
             true => *config |= VALUE_BIT,
@@ -507,8 +504,8 @@ impl Display for DeviceInfo {
     }
 }
 
-impl From<rusb::Error> for Error {
-    fn from(error: rusb::Error) -> Self {
+impl From<hidapi::HidError> for Error {
+    fn from(error: hidapi::HidError) -> Self {
         Error::UsbError(error)
     }
 }
